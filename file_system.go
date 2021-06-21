@@ -7,6 +7,7 @@ package goftp
 import (
 	"bufio"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -138,8 +139,10 @@ func (c *Client) ReadDir(path string) ([]os.FileInfo, error) {
 		if err != nil {
 			return nil, err
 		}
-		parser = func(entry string, skipSelfParent bool) (os.FileInfo, error) {
-			return parseLIST(entry, c.config.ServerLocation, skipSelfParent)
+
+		parser, err = c.detectServerType(entries)
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -189,6 +192,42 @@ func (c *Client) Stat(path string) (os.FileInfo, error) {
 	}
 
 	return parseMLST(strings.TrimLeft(lines[1], " "), false)
+}
+
+// detectServerType attempts to autodetect server type
+func (c *Client) detectServerType(entries []string) (parser func(entry string, skipSelfParent bool) (fs.FileInfo, error), err error) {
+	var srvType serverType
+
+	lines, err := c.controlStringList("SYST")
+	if err != nil {
+		if !commandNotSupporterdError(err) {
+			return nil, err
+		}
+
+		srvType = parseServerTypeFromList(entries)
+	} else {
+		srvType = parseServerTypeFromSyst(lines)
+	}
+
+	c.debug("system found: %s", srvType)
+
+	// Choose a parser
+	switch srvType {
+	case msServer:
+		parser = func(entry string, skipSelfParent bool) (os.FileInfo, error) {
+			return parseMSLIST(entry, c.config.ServerLocation, skipSelfParent)
+		}
+	case zOS:
+		parser = func(entry string, skipSelfParent bool) (os.FileInfo, error) {
+			return parseZOSLIST(entry, c.config.ServerLocation, skipSelfParent)
+		}
+	default:
+		parser = func(entry string, skipSelfParent bool) (os.FileInfo, error) {
+			return parseLIST(entry, c.config.ServerLocation, skipSelfParent)
+		}
+	}
+
+	return parser, nil
 }
 
 func extractDirName(msg string) (string, error) {
@@ -332,13 +371,22 @@ func parseLIST(entry string, loc *time.Location, skipSelfParent bool) (os.FileIn
 
 	matches := lsRegex.FindStringSubmatch(entry)
 	if len(matches) == 0 {
-		return nil, ftpError{err: fmt.Errorf(`failed parsing LIST entry: %s`, entry)}
+		return nil, ftpError{err: fmt.Errorf(`parseLIST() failed parsing LIST entry: (%s)`, entry)}
 	}
 
 	if skipSelfParent && (matches[8] == "." || matches[8] == "..") {
 		return nil, nil
 	}
 
+	info, err := parseFileInfo(matches, entry, loc)
+	if err != nil {
+		return nil, err
+	}
+
+	return info, nil
+}
+
+func parseFileInfo(matches []string, entry string, loc *time.Location) (*ftpFile, error) {
 	var mode os.FileMode
 	switch matches[1] {
 	case "d":
@@ -389,6 +437,101 @@ func parseLIST(entry string, loc *time.Location, skipSelfParent bool) (os.FileIn
 		mtime: mtime,
 		raw:   entry,
 		size:  int64(size),
+	}
+
+	return info, nil
+}
+
+var lsRegexMS = regexp.MustCompile(`^(\d+-\d+-\d+)\s+(\d+:\d+[^ ]+)\s+([^ ]+)\s+(.*)$`)
+
+// 07-23-21     05:03PM    <DIR>         git-dir-ignored
+// 07-23-21     05:03PM           272    git-ignored
+func parseMSLIST(entry string, loc *time.Location, skipSelfParent bool) (os.FileInfo, error) {
+	if strings.HasPrefix(entry, "total ") {
+		return nil, nil
+	}
+
+	msmatches := lsRegexMS.FindStringSubmatch(entry)
+	if len(msmatches) == 0 {
+		return nil, ftpError{err: fmt.Errorf(`parseMSLIST() failed parsing LIST entry: (%s)`, entry)}
+	}
+
+	// normalize MS to Unix based
+	matches := make([]string, 10)
+	matches[0] = msmatches[0]
+	if strings.ToUpper(msmatches[3]) == "<DIR>" {
+		matches[1] = "d"
+		matches[5] = "0"
+	} else {
+		matches[1] = "-"
+		matches[5] = msmatches[3]
+	}
+	matches[2] = "rwx"
+	matches[3] = "rwx"
+	matches[4] = "rwx"
+	if d, e := time.Parse("01-02-06", msmatches[1]); e == nil {
+		matches[6] = d.Format("Jan _2")
+	}
+	if t, e := time.Parse("03:04pm", strings.ToLower(msmatches[2])); e == nil {
+		matches[7] = t.Format("15:04")
+	}
+	matches[8] = msmatches[4]
+
+	if skipSelfParent && (matches[8] == "." || matches[8] == "..") {
+		return nil, nil
+	}
+
+	info, err := parseFileInfo(matches, entry, loc)
+	if err != nil {
+		return nil, err
+	}
+
+	return info, nil
+}
+
+var lsRegexZOS = regexp.MustCompile(`^\S+\s\S+\s+(\d{4}/\d{2}/\d{2})\s+\d+\s+\d+\s+\S+\s+\d+\s+(\d+)\s+\S+\s+(.*)$`)
+var lsRegexZOSshort = regexp.MustCompile(`^\s*\S+\s+(\S+)$`)
+
+// Volume Unit    Referred Ext Used Recfm Lrecl BlkSz Dsorg Dsname
+// FTP001 1148   2021/06/15  1   15  U     7998  7998  PS  FILE.ZIP
+// Migrated                                                FILE2.ZIP
+// GDG  FILE3.ZIP
+func parseZOSLIST(entry string, loc *time.Location, skipSelfParent bool) (os.FileInfo, error) {
+	if strings.HasPrefix(entry, "Volume Unit ") {
+		return nil, nil
+	}
+
+	zosmatches := lsRegexZOS.FindStringSubmatch(entry)
+	if len(zosmatches) == 0 {
+		shortmatches := lsRegexZOSshort.FindStringSubmatch(entry)
+		if len(shortmatches) == 0 {
+			return parseLIST(entry, loc, skipSelfParent)
+		}
+
+		zosmatches = []string{shortmatches[0], time.Now().Format("2006/01/02"), "0", shortmatches[1]}
+	}
+
+	// normalize z/OS to Unix based
+	matches := make([]string, 10)
+	matches[0] = zosmatches[0]
+	matches[1] = "-"
+	matches[2] = "rwx"
+	matches[3] = "rwx"
+	matches[4] = "rwx"
+	matches[5] = zosmatches[2]
+	if d, e := time.Parse("2006/01/02", zosmatches[1]); e == nil {
+		matches[6] = d.Format("Jan _2")
+	}
+	matches[7] = "00:00"
+	matches[8] = zosmatches[3]
+
+	if skipSelfParent && (matches[8] == "." || matches[8] == "..") {
+		return nil, nil
+	}
+
+	info, err := parseFileInfo(matches, entry, loc)
+	if err != nil {
+		return nil, err
 	}
 
 	return info, nil
@@ -494,3 +637,60 @@ func parseMLST(entry string, skipSelfParent bool) (os.FileInfo, error) {
 
 	return info, nil
 }
+
+func parseServerTypeFromSyst(lines []string) serverType {
+	if len(lines) == 0 {
+		return defaultServer
+	}
+
+	for _, line := range lines {
+		line = strings.ToLower(line)
+
+		if strings.Contains(line, "iis") {
+			return msServer
+		}
+
+		if strings.Contains(line, "z/os") {
+			return zOS
+		}
+	}
+
+	return defaultServer
+}
+
+func parseServerTypeFromList(entries []string) serverType {
+	if len(entries) > 3 {
+		entries = entries[:3]
+	}
+
+	for _, entry := range entries {
+		if matches := lsRegex.FindStringSubmatch(entry); matches != nil {
+			return defaultServer
+		}
+
+		if matches := lsRegexMS.FindStringSubmatch(entry); matches != nil {
+			return msServer
+		}
+
+		if strings.HasPrefix(entry, "Volume Unit ") && strings.HasSuffix(entry, " Dsname") {
+			return zOS
+		}
+	}
+
+	return defaultServer
+}
+
+type serverType string
+
+const (
+	// defaultServer is used when the default parser can
+	// be used, when SYST is not supported or return when
+	// the SYST return string is not recognized
+	defaultServer serverType = "default"
+
+	// msServer represents the Microsoft FTP Service
+	msServer serverType = "Microsoft FTP Service"
+
+	// zOS represents IBM z/OS operating system
+	zOS serverType = "z/OS"
+)

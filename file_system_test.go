@@ -480,3 +480,48 @@ func TestGetwd(t *testing.T) {
 		}
 	}
 }
+
+func Test_lsRegexZOS(t *testing.T) {
+	type args struct {
+		entry string
+	}
+	tests := []struct {
+		name string
+		args args
+		want []string
+	}{
+		{name: "full listing", args: args{entry: "FTP001 1148   2021/06/15  1   15  U     7798  7998  PS  FILE.ZIP"}, want: []string{"2021/06/15", "7998", "FILE.ZIP"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := lsRegexZOS.FindStringSubmatch(tt.args.entry)
+			if len(got) == 0 || !reflect.DeepEqual(got[1:], tt.want) {
+				t.Errorf("lsRegexZOS.FindStringSubmatch() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_lsRegexZOSshort(t *testing.T) {
+	type args struct {
+		entry string
+	}
+	tests := []struct {
+		name string
+		args args
+		want []string
+	}{
+		{name: "long listing", args: args{entry: "Migrated                                                FILE2.ZIP"}, want: []string{"Migrated                                                FILE2.ZIP", "FILE2.ZIP"}},
+		{name: "short listing", args: args{entry: "GDG  FILE3.ZIP"}, want: []string{"GDG  FILE3.ZIP", "FILE3.ZIP"}},
+		{name: "short listing", args: args{entry: "   GDG  FILE3.ZIP"}, want: []string{"   GDG  FILE3.ZIP", "FILE3.ZIP"}},
+		{name: "fail to match", args: args{entry: "drwxr-xr-x   8 goftp    20            272 Jul 28 05:03 git-ignored"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := lsRegexZOSshort.FindStringSubmatch(tt.args.entry)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("lsRegexZOSshort.FindStringSubmatch() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
